@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote
 
@@ -11,8 +12,7 @@ BASE_TITLE = "وزارة الأوقاف والشؤون الإسلامية — م
 HTML_FILENAME = f"{BASE_TITLE}.html"
 ASSETS_DIRNAME = f"{BASE_TITLE}_files"
 
-# Ziel-URL bzw. Basis-URL für Assets (per Umgebungsvariable TARGET_URL oder BASE_URL überschreibbar)
-TARGET_URL = os.getenv("TARGET_URL", os.getenv("BASE_URL", "https://www.habous.gov.ma/")).strip()
+TARGET_URL = os.getenv("TARGET_URL", "https://www.habous.gov.ma").strip()
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -72,16 +72,28 @@ def build_local_asset_path(asset_url: str, assets_dir: Path, used_names: dict[st
     return full_path
 
 
-def download_binary(session: requests.Session, url: str, referer: str | None = None, timeout: int = 25) -> tuple[bytes, str] | None:
+def fetch_with_retry(session: requests.Session, url: str, referer: str | None = None, timeout: int = 30, retries: int = 2) -> requests.Response | None:
     headers = {"Referer": referer} if referer else {}
-    try:
-        resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "").lower()
-        return resp.content, content_type
-    except requests.RequestException as exc:
-        print(f"[WARN] Konnte Ressource nicht laden ({url}): {exc}")
+    for attempt in range(retries + 1):
+        try:
+            resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as exc:
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+            else:
+                print(f"[WARN] Konnte Ressource nicht laden ({url}): {exc}")
+                return None
+    return None
+
+
+def download_binary(session: requests.Session, url: str, referer: str | None = None) -> tuple[bytes, str] | None:
+    resp = fetch_with_retry(session, url, referer=referer)
+    if not resp:
         return None
+    content_type = resp.headers.get("Content-Type", "").lower()
+    return resp.content, content_type
 
 
 def rewrite_css_urls(
@@ -210,6 +222,131 @@ def rewrite_srcset(
     return ", ".join(new_parts)
 
 
+def process_soup_assets(
+    soup: BeautifulSoup,
+    page_url: str,
+    session: requests.Session,
+    assets_dir: Path,
+    assets_dirname: str,
+    used_names: dict[str, str],
+    visited_frames: set[str],
+) -> None:
+    for link_tag in soup.find_all("link", href=True):
+        href = link_tag.get("href", "").strip()
+        rel_vals = [r.lower() for r in (link_tag.get("rel") or [])]
+        is_css = "stylesheet" in rel_vals or href.lower().endswith(".css")
+        as_attr = (link_tag.get("as") or "").lower()
+
+        if is_css or any(r in rel_vals for r in ("icon", "shortcut icon", "apple-touch-icon")) or as_attr in ("style", "image", "font"):
+            local_rel = process_asset(
+                href,
+                page_url,
+                session,
+                assets_dir,
+                assets_dirname,
+                used_names,
+                default_ext=".css" if is_css else "",
+                is_stylesheet=is_css,
+            )
+            if local_rel:
+                link_tag["href"] = local_rel
+
+    for script_tag in soup.find_all("script", src=True):
+        src = script_tag.get("src", "").strip()
+        local_rel = process_asset(
+            src,
+            page_url,
+            session,
+            assets_dir,
+            assets_dirname,
+            used_names,
+            default_ext=".js",
+        )
+        if local_rel:
+            script_tag["src"] = local_rel
+
+    for tag in soup.find_all(["img", "source", "video", "audio"]):
+        if tag.has_attr("src"):
+            local_rel = process_asset(
+                tag["src"],
+                page_url,
+                session,
+                assets_dir,
+                assets_dirname,
+                used_names,
+            )
+            if local_rel:
+                tag["src"] = local_rel
+
+        if tag.has_attr("poster"):
+            local_poster = process_asset(
+                tag["poster"],
+                page_url,
+                session,
+                assets_dir,
+                assets_dirname,
+                used_names,
+            )
+            if local_poster:
+                tag["poster"] = local_poster
+
+        if tag.has_attr("srcset") and tag["srcset"]:
+            tag["srcset"] = rewrite_srcset(
+                tag["srcset"],
+                page_url,
+                session,
+                assets_dir,
+                assets_dirname,
+                used_names,
+            )
+
+    # Eingebettete <iframe>-Seiten (z. B. Widgets) ebenfalls lokal speichern
+    for iframe_tag in soup.find_all("iframe", src=True):
+        raw_src = iframe_tag.get("src", "").strip()
+        if not raw_src or raw_src.startswith(("data:", "javascript:", "#")):
+            continue
+        frame_url = urljoin(page_url, raw_src)
+        if frame_url in visited_frames:
+            continue
+        visited_frames.add(frame_url)
+
+        frame_resp = fetch_with_retry(session, frame_url, referer=page_url)
+        if not frame_resp:
+            continue
+
+        if not frame_resp.encoding or frame_resp.encoding.lower() == "iso-8859-1":
+            frame_resp.encoding = frame_resp.apparent_encoding or "utf-8"
+
+        frame_soup = BeautifulSoup(frame_resp.text, "html.parser")
+        process_soup_assets(frame_soup, frame_url, session, assets_dir, assets_dirname, used_names, visited_frames)
+
+        frame_path = build_local_asset_path(frame_url, assets_dir, used_names, default_ext=".html")
+        try:
+            frame_path.write_text(str(frame_soup), encoding="utf-8")
+            iframe_tag["src"] = f"{assets_dirname}/{frame_path.name}"
+        except OSError as exc:
+            print(f"[WARN] Konnte iFrame nicht speichern ({frame_path}): {exc}")
+
+    for style_tag in soup.find_all("style"):
+        if style_tag.string:
+            style_tag.string = rewrite_css_urls(
+                style_tag.string,
+                page_url,
+                session,
+                assets_dir,
+                used_names,
+            )
+
+    for styled_tag in soup.find_all(style=True):
+        styled_tag["style"] = rewrite_css_urls(
+            styled_tag["style"],
+            page_url,
+            session,
+            assets_dir,
+            used_names,
+        )
+
+
 def mirror_website(target_url: str, html_filename: str, assets_dirname: str) -> None:
     if not target_url:
         raise ValueError("Bitte eine gültige Ziel-URL in TARGET_URL angeben.")
@@ -226,102 +363,18 @@ def mirror_website(target_url: str, html_filename: str, assets_dirname: str) -> 
     session = create_session()
 
     print(f"[INFO] Lade Ziel-URL: {target_url}")
-    response = session.get(target_url, timeout=30)
-    response.raise_for_status()
+    response = fetch_with_retry(session, target_url)
+    if not response:
+        raise RuntimeError(f"Hauptseite konnte nicht geladen werden: {target_url}")
 
     if not response.encoding or response.encoding.lower() == "iso-8859-1":
         response.encoding = response.apparent_encoding or "utf-8"
 
     soup = BeautifulSoup(response.text, "html.parser")
     used_names: dict[str, str] = {}
+    visited_frames: set[str] = {target_url}
 
-    for link_tag in soup.find_all("link", href=True):
-        href = link_tag.get("href", "").strip()
-        rel_vals = [r.lower() for r in (link_tag.get("rel") or [])]
-        is_css = "stylesheet" in rel_vals or href.lower().endswith(".css")
-        as_attr = (link_tag.get("as") or "").lower()
-
-        if is_css or any(r in rel_vals for r in ("icon", "shortcut icon", "apple-touch-icon")) or as_attr in ("style", "image", "font"):
-            local_rel = process_asset(
-                href,
-                target_url,
-                session,
-                assets_dir,
-                assets_dirname,
-                used_names,
-                default_ext=".css" if is_css else "",
-                is_stylesheet=is_css,
-            )
-            if local_rel:
-                link_tag["href"] = local_rel
-
-    for script_tag in soup.find_all("script", src=True):
-        src = script_tag.get("src", "").strip()
-        local_rel = process_asset(
-            src,
-            target_url,
-            session,
-            assets_dir,
-            assets_dirname,
-            used_names,
-            default_ext=".js",
-        )
-        if local_rel:
-            script_tag["src"] = local_rel
-
-    for tag in soup.find_all(["img", "source", "video", "audio", "iframe"]):
-        if tag.has_attr("src"):
-            local_rel = process_asset(
-                tag["src"],
-                target_url,
-                session,
-                assets_dir,
-                assets_dirname,
-                used_names,
-            )
-            if local_rel:
-                tag["src"] = local_rel
-
-        if tag.has_attr("poster"):
-            local_poster = process_asset(
-                tag["poster"],
-                target_url,
-                session,
-                assets_dir,
-                assets_dirname,
-                used_names,
-            )
-            if local_poster:
-                tag["poster"] = local_poster
-
-        if tag.has_attr("srcset") and tag["srcset"]:
-            tag["srcset"] = rewrite_srcset(
-                tag["srcset"],
-                target_url,
-                session,
-                assets_dir,
-                assets_dirname,
-                used_names,
-            )
-
-    for style_tag in soup.find_all("style"):
-        if style_tag.string:
-            style_tag.string = rewrite_css_urls(
-                style_tag.string,
-                target_url,
-                session,
-                assets_dir,
-                used_names,
-            )
-
-    for styled_tag in soup.find_all(style=True):
-        styled_tag["style"] = rewrite_css_urls(
-            styled_tag["style"],
-            target_url,
-            session,
-            assets_dir,
-            used_names,
-        )
+    process_soup_assets(soup, target_url, session, assets_dir, assets_dirname, used_names, visited_frames)
 
     meta_charset = soup.find("meta", attrs={"charset": True})
     if meta_charset:
