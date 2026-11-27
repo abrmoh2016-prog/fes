@@ -9,8 +9,12 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE_TITLE = "وزارة الأوقاف والشؤون الإسلامية — مواقيت الصلاة وخطبة الجمعة"
-HTML_FILENAME = f"{BASE_TITLE}.html"
-ASSETS_DIRNAME = f"{BASE_TITLE}_files"
+TEMP_HTML_FILENAME = f"{BASE_TITLE}.html"
+TEMP_ASSETS_DIRNAME = f"{BASE_TITLE}_files"
+
+FINAL_BASE_NAME = "times"
+FINAL_HTML_FILENAME = f"{FINAL_BASE_NAME}.html"
+FINAL_ASSETS_DIRNAME = f"{FINAL_BASE_NAME}_files"
 
 TARGET_URL = os.getenv("TARGET_URL", "https://www.habous.gov.ma").strip()
 
@@ -72,7 +76,13 @@ def build_local_asset_path(asset_url: str, assets_dir: Path, used_names: dict[st
     return full_path
 
 
-def fetch_with_retry(session: requests.Session, url: str, referer: str | None = None, timeout: int = 30, retries: int = 2) -> requests.Response | None:
+def fetch_with_retry(
+    session: requests.Session,
+    url: str,
+    referer: str | None = None,
+    timeout: int = 30,
+    retries: int = 2,
+) -> requests.Response | None:
     headers = {"Referer": referer} if referer else {}
     for attempt in range(retries + 1):
         try:
@@ -237,7 +247,11 @@ def process_soup_assets(
         is_css = "stylesheet" in rel_vals or href.lower().endswith(".css")
         as_attr = (link_tag.get("as") or "").lower()
 
-        if is_css or any(r in rel_vals for r in ("icon", "shortcut icon", "apple-touch-icon")) or as_attr in ("style", "image", "font"):
+        if (
+            is_css
+            or any(r in rel_vals for r in ("icon", "shortcut icon", "apple-touch-icon"))
+            or as_attr in ("style", "image", "font")
+        ):
             local_rel = process_asset(
                 href,
                 page_url,
@@ -300,7 +314,6 @@ def process_soup_assets(
                 used_names,
             )
 
-    # Eingebettete <iframe>-Seiten (z. B. Widgets) ebenfalls lokal speichern
     for iframe_tag in soup.find_all("iframe", src=True):
         raw_src = iframe_tag.get("src", "").strip()
         if not raw_src or raw_src.startswith(("data:", "javascript:", "#")):
@@ -347,18 +360,38 @@ def process_soup_assets(
         )
 
 
-def mirror_website(target_url: str, html_filename: str, assets_dirname: str) -> None:
+def update_local_references(html_text: str, old_folder_name: str, new_folder_name: str) -> str:
+    """Ersetzt Verweise auf den alten Ordnernamen durch den neuen Ordnernamen ('times_files')."""
+    return html_text.replace(f"{old_folder_name}/", f"{new_folder_name}/")
+
+
+def cleanup_previous_outputs(*paths: Path) -> None:
+    """Löscht vorhandene Dateien oder Ordner vor dem Verschieben/Umbenennen."""
+    for p in paths:
+        if p.is_dir():
+            shutil.rmtree(p)
+        elif p.exists():
+            p.unlink()
+
+
+def mirror_and_rename(
+    target_url: str,
+    temp_html_filename: str,
+    temp_assets_dirname: str,
+    final_html_filename: str,
+    final_assets_dirname: str,
+) -> None:
     if not target_url:
         raise ValueError("Bitte eine gültige Ziel-URL in TARGET_URL angeben.")
 
-    html_path = Path(html_filename)
-    assets_dir = Path(assets_dirname)
+    temp_html_path = Path(temp_html_filename)
+    temp_assets_dir = Path(temp_assets_dirname)
+    final_html_path = Path(final_html_filename)
+    final_assets_dir = Path(final_assets_dirname)
 
-    # Alten Asset-Ordner vor jedem neuen Speichervorgang löschen
-    if assets_dir.exists():
-        print(f"[INFO] Lösche alten Asset-Ordner: {assets_dir}")
-        shutil.rmtree(assets_dir)
-    assets_dir.mkdir(parents=True, exist_ok=True)
+    # Alte temporäre und finale Asset-Ordner vor jedem neuen Lauf entfernen
+    cleanup_previous_outputs(temp_html_path, temp_assets_dir, final_html_path, final_assets_dir)
+    temp_assets_dir.mkdir(parents=True, exist_ok=True)
 
     session = create_session()
 
@@ -374,15 +407,31 @@ def mirror_website(target_url: str, html_filename: str, assets_dirname: str) -> 
     used_names: dict[str, str] = {}
     visited_frames: set[str] = {target_url}
 
-    process_soup_assets(soup, target_url, session, assets_dir, assets_dirname, used_names, visited_frames)
+    process_soup_assets(soup, target_url, session, temp_assets_dir, temp_assets_dirname, used_names, visited_frames)
 
     meta_charset = soup.find("meta", attrs={"charset": True})
     if meta_charset:
         meta_charset["charset"] = "utf-8"
 
-    html_path.write_text(str(soup), encoding="utf-8")
-    print(f"[OK] Gespeichert: {html_path} ({len(used_names)} Assets in {assets_dirname})")
+    # HTML-Inhalt so umschreiben, dass alle Pfade direkt auf 'times_files/' zeigen
+    rewritten_html = update_local_references(str(soup), temp_assets_dirname, final_assets_dirname)
+
+    # Erst unter ursprünglichem Namen speichern und dann zu 'times.html' / 'times_files' umbenennen
+    temp_html_path.write_text(rewritten_html, encoding="utf-8")
+    temp_assets_dir.rename(final_assets_dir)
+    temp_html_path.rename(final_html_path)
+
+    print(
+        f"[OK] Gespeichert und umbenannt: {final_html_path} und {final_assets_dir} "
+        f"({len(used_names)} Assets)"
+    )
 
 
 if __name__ == "__main__":
-    mirror_website(TARGET_URL, HTML_FILENAME, ASSETS_DIRNAME)
+    mirror_and_rename(
+        TARGET_URL,
+        TEMP_HTML_FILENAME,
+        TEMP_ASSETS_DIRNAME,
+        FINAL_HTML_FILENAME,
+        FINAL_ASSETS_DIRNAME,
+    )
