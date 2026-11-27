@@ -1,4 +1,3 @@
-import hashlib
 import os
 import re
 import shutil
@@ -8,12 +7,12 @@ from urllib.parse import urljoin, urlparse, unquote
 import requests
 from bs4 import BeautifulSoup
 
-# Ziel-URL hier eintragen (oder per Umgebungsvariable TARGET_URL übergeben)
-TARGET_URL = os.getenv("TARGET_URL", "[DEINE_ZIEL_URL_HIER_EINFÜGEN]").strip()
-
 BASE_TITLE = "وزارة الأوقاف والشؤون الإسلامية — مواقيت الصلاة وخطبة الجمعة"
 HTML_FILENAME = f"{BASE_TITLE}.html"
 ASSETS_DIRNAME = f"{BASE_TITLE}_files"
+
+# Ziel-URL bzw. Basis-URL für Assets (per Umgebungsvariable TARGET_URL oder BASE_URL überschreibbar)
+TARGET_URL = os.getenv("TARGET_URL", os.getenv("BASE_URL", "https://www.habous.gov.ma/")).strip()
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -25,7 +24,6 @@ CSS_URL_PATTERN = re.compile(r"""url\(\s*(['"]?)(?!data:|#)([^'")]+)\1\s*\)""", 
 
 
 def create_session() -> requests.Session:
-    """Erstellt eine HTTP-Session mit realistischem User-Agent und UTF-8-Präferenz."""
     session = requests.Session()
     session.headers.update(
         {
@@ -39,7 +37,6 @@ def create_session() -> requests.Session:
 
 
 def sanitize_filename(name: str, fallback_ext: str = "") -> str:
-    """Bereinigt Dateinamen für das Dateisystem und bewahrt Unicode-/Arabisch-Zeichen."""
     name = unquote(name).strip()
     name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", name)
     name = name.strip(" .")
@@ -47,7 +44,6 @@ def sanitize_filename(name: str, fallback_ext: str = "") -> str:
         name = "asset"
     if fallback_ext and not Path(name).suffix:
         name = f"{name}{fallback_ext}"
-    # Sehr lange Dateinamen kürzen, um Pfadprobleme zu vermeiden
     if len(name) > 120:
         stem = Path(name).stem[:100]
         suffix = Path(name).suffix[:16]
@@ -56,32 +52,27 @@ def sanitize_filename(name: str, fallback_ext: str = "") -> str:
 
 
 def build_local_asset_path(asset_url: str, assets_dir: Path, used_names: dict[str, str], default_ext: str = "") -> Path:
-    """Erzeugt einen eindeutigen, lesbaren lokalen Dateipfad im Asset-Ordner."""
     if asset_url in used_names:
         return Path(used_names[asset_url])
 
     parsed = urlparse(asset_url)
     raw_name = Path(parsed.path).name
     ext = Path(raw_name).suffix.lower() if Path(raw_name).suffix else default_ext
-
-    # Hash aus der vollständigen URL (inkl. Query-Parametern) verhindert Kollisionen
-    url_hash = hashlib.sha1(asset_url.encode("utf-8")).hexdigest()[:8]
     stem = sanitize_filename(Path(raw_name).stem if raw_name else "resource")
-    final_name = sanitize_filename(f"{stem}_{url_hash}{ext}")
+    candidate = sanitize_filename(f"{stem}{ext}")
 
-    full_path = assets_dir / final_name
+    full_path = assets_dir / candidate
     counter = 1
-    while full_path.exists() and full_path.name not in used_names.values():
-        final_name = sanitize_filename(f"{stem}_{url_hash}_{counter}{ext}")
-        full_path = assets_dir / final_name
+    while full_path.exists() or candidate in used_names.values():
+        candidate = sanitize_filename(f"{stem}_{counter}{ext}")
+        full_path = assets_dir / candidate
         counter += 1
 
-    used_names[asset_url] = final_name
+    used_names[asset_url] = candidate
     return full_path
 
 
 def download_binary(session: requests.Session, url: str, referer: str | None = None, timeout: int = 25) -> tuple[bytes, str] | None:
-    """Lädt eine Ressource fehlertolerant herunter und gibt (Inhalt, Content-Type) zurück."""
     headers = {"Referer": referer} if referer else {}
     try:
         resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
@@ -100,8 +91,6 @@ def rewrite_css_urls(
     assets_dir: Path,
     used_names: dict[str, str],
 ) -> str:
-    """Lädt in CSS enthaltene url(...)-Assets herunter und schreibt sie auf relative Pfade um."""
-
     def replace_match(match: re.Match) -> str:
         raw_ref = match.group(2).strip()
         if not raw_ref or raw_ref.startswith(("data:", "blob:", "#")):
@@ -132,7 +121,6 @@ def rewrite_css_urls(
             print(f"[WARN] Konnte CSS-Asset nicht speichern ({local_file}): {exc}")
             return match.group(0)
 
-        # CSS-Dateien liegen direkt in assets_dir, daher ist der Dateiname selbst der relative Pfad
         return f'url("{local_file.name}")'
 
     return CSS_URL_PATTERN.sub(replace_match, css_text)
@@ -148,11 +136,11 @@ def process_asset(
     default_ext: str = "",
     is_stylesheet: bool = False,
 ) -> str | None:
-    """Lädt ein Asset herunter, verarbeitet ggf. CSS-Inhalte und gibt den relativen HTML-Pfad zurück."""
-    if not raw_url or raw_url.strip().startswith(("data:", "javascript:", "mailto:", "tel:", "#")):
+    trimmed = raw_url.strip()
+    if not trimmed or trimmed.startswith(("data:", "javascript:", "mailto:", "tel:", "#")):
         return None
 
-    abs_url = urljoin(page_url, raw_url.strip())
+    abs_url = urljoin(page_url, trimmed)
     downloaded = download_binary(session, abs_url, referer=page_url)
     if not downloaded:
         return None
@@ -199,7 +187,6 @@ def rewrite_srcset(
     assets_dirname: str,
     used_names: dict[str, str],
 ) -> str:
-    """Aktualisiert alle URLs innerhalb eines srcset-Attributs auf lokale relative Pfade."""
     parts = [p.strip() for p in srcset_value.split(",") if p.strip()]
     new_parts: list[str] = []
 
@@ -224,13 +211,13 @@ def rewrite_srcset(
 
 
 def mirror_website(target_url: str, html_filename: str, assets_dirname: str) -> None:
-    if not target_url or target_url == "[DEINE_ZIEL_URL_HIER_EINFÜGEN]":
-        raise ValueError("Bitte eine gültige Ziel-URL in TARGET_URL oder per Umgebungsvariable TARGET_URL angeben.")
+    if not target_url:
+        raise ValueError("Bitte eine gültige Ziel-URL in TARGET_URL angeben.")
 
     html_path = Path(html_filename)
     assets_dir = Path(assets_dirname)
 
-    # 1. Alten Asset-Ordner vor jedem neuen Speichervorgang löschen
+    # Alten Asset-Ordner vor jedem neuen Speichervorgang löschen
     if assets_dir.exists():
         print(f"[INFO] Lösche alten Asset-Ordner: {assets_dir}")
         shutil.rmtree(assets_dir)
@@ -238,20 +225,16 @@ def mirror_website(target_url: str, html_filename: str, assets_dirname: str) -> 
 
     session = create_session()
 
-    # 2. Hauptseite herunterladen
     print(f"[INFO] Lade Ziel-URL: {target_url}")
     response = session.get(target_url, timeout=30)
     response.raise_for_status()
 
-    # Saubere UTF-8-Erkennung sicherstellen
     if not response.encoding or response.encoding.lower() == "iso-8859-1":
         response.encoding = response.apparent_encoding or "utf-8"
-    html_text = response.text
 
-    soup = BeautifulSoup(html_text, "html.parser")
+    soup = BeautifulSoup(response.text, "html.parser")
     used_names: dict[str, str] = {}
 
-    # 3. <link> Elemente (Stylesheets, Icons, Preloads)
     for link_tag in soup.find_all("link", href=True):
         href = link_tag.get("href", "").strip()
         rel_vals = [r.lower() for r in (link_tag.get("rel") or [])]
@@ -272,7 +255,6 @@ def mirror_website(target_url: str, html_filename: str, assets_dirname: str) -> 
             if local_rel:
                 link_tag["href"] = local_rel
 
-    # 4. <script> Elemente mit src
     for script_tag in soup.find_all("script", src=True):
         src = script_tag.get("src", "").strip()
         local_rel = process_asset(
@@ -287,9 +269,7 @@ def mirror_website(target_url: str, html_filename: str, assets_dirname: str) -> 
         if local_rel:
             script_tag["src"] = local_rel
 
-    # 5. Bilder, Videos, Audio, Quellen und Poster (src & srcset)
-    media_tags = soup.find_all(["img", "source", "video", "audio", "iframe"])
-    for tag in media_tags:
+    for tag in soup.find_all(["img", "source", "video", "audio", "iframe"]):
         if tag.has_attr("src"):
             local_rel = process_asset(
                 tag["src"],
@@ -324,7 +304,6 @@ def mirror_website(target_url: str, html_filename: str, assets_dirname: str) -> 
                 used_names,
             )
 
-    # 6. Inline-<style>-Blöcke mit url(...)
     for style_tag in soup.find_all("style"):
         if style_tag.string:
             style_tag.string = rewrite_css_urls(
@@ -335,7 +314,6 @@ def mirror_website(target_url: str, html_filename: str, assets_dirname: str) -> 
                 used_names,
             )
 
-    # 7. Inline-style=""-Attribute mit url(...)
     for styled_tag in soup.find_all(style=True):
         styled_tag["style"] = rewrite_css_urls(
             styled_tag["style"],
@@ -345,13 +323,11 @@ def mirror_website(target_url: str, html_filename: str, assets_dirname: str) -> 
             used_names,
         )
 
-    # 8. Meta-Charset auf UTF-8 setzen/sicherstellen und HTML speichern
     meta_charset = soup.find("meta", attrs={"charset": True})
     if meta_charset:
         meta_charset["charset"] = "utf-8"
 
-    output_html = soup.prettify() if False else str(soup)
-    html_path.write_text(output_html, encoding="utf-8")
+    html_path.write_text(str(soup), encoding="utf-8")
     print(f"[OK] Gespeichert: {html_path} ({len(used_names)} Assets in {assets_dirname})")
 
 
