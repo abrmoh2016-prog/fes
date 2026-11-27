@@ -1,1 +1,73 @@
+name: Daily Website Update (Africa/Casablanca 00:01)
 
+on:
+  # Läuft jede Stunde um :01 UTC; der Prüfschritt startet das Skript exakt um 00:01 Uhr in Africa/Casablanca
+  # (inkl. marokkanischer Zeitumstellungen / Ramadan-Regelungen).
+  schedule:
+    - cron: "1 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-site:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Prüfen, ob in Africa/Casablanca gerade 00:01 Uhr ist
+        id: time_check
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manueller Start (workflow_dispatch) – Ausführung freigegeben."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CURRENT_HM=$(TZ="Africa/Casablanca" date +"%H:%M")
+          echo "Aktuelle Zeit in Africa/Casablanca: $CURRENT_HM"
+          if [ "$CURRENT_HM" = "00:01" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Python einrichten
+        if: steps.time_check.outputs.should_run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Abhängigkeiten installieren
+        if: steps.time_check.outputs.should_run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Webseite und Assets aktualisieren
+        if: steps.time_check.outputs.should_run == 'true'
+        env:
+          TARGET_URL: ${{ vars.TARGET_URL }}
+        run: python update_site.py
+
+      - name: Änderungen committen und auf main pushen
+        if: steps.time_check.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --staged --quiet; then
+            echo "Keine Änderungen erkannt – kein Commit nötig."
+            exit 0
+          fi
+
+          STAMP=$(TZ="Africa/Casablanca" date +"%Y-%m-%d %H:%M %Z")
+          git commit -m "chore: update mirrored site ($STAMP)"
+          git push origin main
